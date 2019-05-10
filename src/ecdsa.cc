@@ -33,6 +33,23 @@ int nonce_function_custom(unsigned char *nonce32, const unsigned char *msg32, co
   return 1;
 }
 
+
+// Check that the sig has a low R value and will be less than 71 bytes
+bool SigHasLowR(const secp256k1_context *ctx,
+                const secp256k1_ecdsa_signature *sig) {
+  unsigned char compact_sig[64];
+  secp256k1_ecdsa_signature_serialize_compact(ctx, compact_sig, sig);
+
+  // In DER serialization, all values are interpreted as big-endian, signed
+  // integers. The highest bit in the integer indicates its signed-ness; 0 is
+  // positive, 1 is negative. When the value is interpreted as a negative
+  // integer, it must be converted to a positive value by prepending a 0x00 byte
+  // so that the highest bit is 0. We can avoid this prepending by ensuring that
+  // our highest bit is always 0, and thus we must check that the first byte is
+  // less than 0x80.
+  return compact_sig[0] < 0x80;
+}
+
 NAN_METHOD(sign) {
   Nan::HandleScope scope;
 
@@ -73,25 +90,24 @@ NAN_METHOD(sign) {
       noncefn = nonce_function_custom;
     }
   }
-
-  secp256k1_ecdsa_recoverable_signature sig;
-  if (secp256k1_ecdsa_sign_recoverable(secp256k1ctx, &sig, msg32, private_key, noncefn, data) == 0) {
-    return Nan::ThrowError(ECDSA_SIGN_FAIL);
+  
+  union {
+    unsigned char extra_entropy[32] = {0};
+    uint32_t counter;
+  };
+  secp256k1_ecdsa_signature signature;
+  int ret = secp256k1_ecdsa_sign(secp256k1ctx, &signature, msg32, private_key,
+                                 noncefn, nullptr);
+  while (ret && !SigHasLowR(secp256k1ctx, &signature)) {
+    ++counter;
+    // boost::endian::native_to_little_inplace(counter);
+    ret = secp256k1_ecdsa_sign(secp256k1ctx, &signature, msg32, private_key,
+                               noncefn, extra_entropy);
+    // boost::endian::little_to_native_inplace(counter);
   }
+  secp256k1_ecdsa_signature_normalize(secp256k1ctx, &signature, &signature);
 
-  unsigned char output[64];
-  int recid;
-  secp256k1_ecdsa_recoverable_signature_serialize_compact(secp256k1ctx, &output[0], &recid, &sig);
-
-  v8::Local<v8::Object> obj = Nan::New<v8::Object>();
-#if (NODE_MODULE_VERSION > NODE_11_0_MODULE_VERSION)
-  obj->Set(info.GetIsolate()->GetCurrentContext(), Nan::New<v8::String>("signature").ToLocalChecked(), COPY_BUFFER(&output[0], 64));
-  obj->Set(info.GetIsolate()->GetCurrentContext(), Nan::New<v8::String>("recovery").ToLocalChecked(), Nan::New<v8::Number>(recid));
-#else
-  obj->Set(Nan::New<v8::String>("signature").ToLocalChecked(), COPY_BUFFER(&output[0], 64));
-  obj->Set(Nan::New<v8::String>("recovery").ToLocalChecked(), Nan::New<v8::Number>(recid));
-#endif
-  info.GetReturnValue().Set(obj);
+  info.GetReturnValue().Set(COPY_BUFFER(&signature, 64));
 }
 
 NAN_METHOD(verify) {
